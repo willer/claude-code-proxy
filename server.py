@@ -1332,10 +1332,18 @@ async def create_message(
                         reasoning_level
                     )
                     
-                    # Use httpx for async streaming
+                    # Use httpx for async streaming with timeout
                     async def direct_anthropic_stream():
-                        async with httpx.AsyncClient() as client:
-                            async with client.stream("POST", api_url, json=request_dict, headers=headers) as response:
+                        # Log request size for debugging
+                        request_json = json.dumps(request_dict)
+                        request_size = len(request_json)
+                        logger.debug(f"Stream request size: {request_size} bytes, {len(request_dict.get('tools', []))} tools")
+                        
+                        # Set higher timeout for large requests with many tools
+                        timeout = 90.0 if len(request_dict.get("tools", [])) > 20 else 60.0
+                        
+                        async with httpx.AsyncClient(timeout=timeout) as client:
+                            async with client.stream("POST", api_url, json=request_dict, headers=headers, timeout=timeout) as response:
                                 # Forward status code if there's an error
                                 if response.status_code != 200:
                                     error_body = await response.aread()
@@ -1355,8 +1363,31 @@ async def create_message(
                     )
                 
                 except Exception as e:
-                    logger.error(f"Error in direct Anthropic streaming: {str(e)}")
-                    raise HTTPException(status_code=500, detail=f"Error in direct Anthropic API call: {str(e)}")
+                    # Get full traceback for detailed debugging
+                    import traceback
+                    error_traceback = traceback.format_exc()
+                    
+                    # Log more helpful info about the request
+                    tool_count = len(request_dict.get('tools', []))
+                    message_count = len(request_dict.get('messages', []))
+                    
+                    # Create a detailed error message
+                    error_message = (
+                        f"Error in direct Anthropic streaming for {model_name} with "
+                        f"{tool_count} tools and {message_count} messages: {str(e)}"
+                    )
+                    
+                    # Log the full details
+                    logger.error(f"{error_message}\n{error_traceback}")
+                    
+                    # Create a more user-friendly error
+                    if "ReadTimeout" in error_traceback or "TimeoutException" in error_traceback:
+                        raise HTTPException(
+                            status_code=504, 
+                            detail=f"Timeout connecting to Anthropic API for streaming. The request may be too large ({tool_count} tools) or the API may be experiencing issues."
+                        )
+                    else:
+                        raise HTTPException(status_code=500, detail=error_message)
                 
             else:
                 # For non-streaming requests, use direct Anthropic API
@@ -1400,9 +1431,18 @@ async def create_message(
                         reasoning_level
                     )
                     
-                    # Use httpx for async request
-                    async with httpx.AsyncClient() as client:
-                        response = await client.post(api_url, json=request_dict, headers=headers)
+                    # Use httpx for async request with timeout
+                    async with httpx.AsyncClient(timeout=60.0) as client:
+                        # Log request size for debugging
+                        request_json = json.dumps(request_dict)
+                        request_size = len(request_json)
+                        logger.debug(f"Request size: {request_size} bytes, {len(request_dict.get('tools', []))} tools")
+                        
+                        # Set higher timeout for large requests with many tools
+                        timeout = 90.0 if len(request_dict.get("tools", [])) > 20 else 60.0
+                        
+                        # Post the request with timeout
+                        response = await client.post(api_url, json=request_dict, headers=headers, timeout=timeout)
                         
                         # Check for errors
                         if response.status_code != 200:
@@ -1415,8 +1455,31 @@ async def create_message(
                         return response.json()
                 
                 except Exception as e:
-                    logger.error(f"Error in direct Anthropic API call: {str(e)}")
-                    raise HTTPException(status_code=500, detail=f"Error in direct Anthropic API call: {str(e)}")
+                    # Get full traceback for detailed debugging
+                    import traceback
+                    error_traceback = traceback.format_exc()
+                    
+                    # Log more helpful info about the request
+                    tool_count = len(request_dict.get('tools', []))
+                    message_count = len(request_dict.get('messages', []))
+                    
+                    # Create a detailed error message
+                    error_message = (
+                        f"Error in direct Anthropic API call for {model_name} with "
+                        f"{tool_count} tools and {message_count} messages: {str(e)}"
+                    )
+                    
+                    # Log the full details
+                    logger.error(f"{error_message}\n{error_traceback}")
+                    
+                    # Create a more user-friendly error
+                    if "ReadTimeout" in error_traceback:
+                        raise HTTPException(
+                            status_code=504, 
+                            detail=f"Timeout connecting to Anthropic API. The request may be too large ({tool_count} tools) or the API may be experiencing issues."
+                        )
+                    else:
+                        raise HTTPException(status_code=500, detail=error_message)
         
         # Standard non-passthrough flow using LiteLLM
         # Convert Anthropic request to LiteLLM format
@@ -1867,9 +1930,13 @@ async def count_tokens(
                     "content-type": "application/json",
                 }
                 
-                # Use httpx for async request
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(api_url, json=request_dict, headers=headers)
+                # Use httpx for async request with timeout
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    # Token counting rarely has too many tools, but still log for debugging
+                    logger.debug(f"Token count request: {len(request_dict.get('tools', []))} tools")
+                    
+                    # Post the request with timeout
+                    response = await client.post(api_url, json=request_dict, headers=headers, timeout=30.0)
                     
                     # Check for errors
                     if response.status_code != 200:
@@ -1883,8 +1950,31 @@ async def count_tokens(
                     return TokenCountResponse(input_tokens=token_count_data.get("input_tokens", 0))
             
             except Exception as e:
-                logger.error(f"Error in direct Anthropic token counting: {str(e)}")
-                raise HTTPException(status_code=500, detail=f"Error in direct Anthropic token counting: {str(e)}")
+                # Get full traceback for detailed debugging
+                import traceback
+                error_traceback = traceback.format_exc()
+                
+                # Log more helpful info about the request
+                tool_count = len(request_dict.get('tools', []))
+                message_count = len(request_dict.get('messages', []))
+                
+                # Create a detailed error message
+                error_message = (
+                    f"Error in direct Anthropic token counting for {model_name} with "
+                    f"{tool_count} tools and {message_count} messages: {str(e)}"
+                )
+                
+                # Log the full details
+                logger.error(f"{error_message}\n{error_traceback}")
+                
+                # Create a more user-friendly error
+                if "ReadTimeout" in error_traceback:
+                    raise HTTPException(
+                        status_code=504, 
+                        detail=f"Timeout connecting to Anthropic API for token counting. The request may be too large ({tool_count} tools) or the API may be experiencing issues."
+                    )
+                else:
+                    raise HTTPException(status_code=500, detail=error_message)
         
         # Standard non-passthrough flow using LiteLLM
         converted_request = convert_anthropic_to_litellm(

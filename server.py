@@ -18,12 +18,26 @@ import sys
 # Load environment variables from .env file
 load_dotenv()
 
-# Configure logging
+# Configure logging based on environment variable
+log_level_str = os.environ.get("LOGLEVEL", "WARN").upper()
+log_level = getattr(logging, log_level_str, logging.WARN)
 logging.basicConfig(
-    level=logging.WARN,  # Change to INFO level to show more details
+    level=log_level,
     format='%(asctime)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger(__name__)
+logger.info(f"Logger initialized with level: {log_level_str}")
+
+# Check if we should show detailed model information
+SHOW_MODEL_DETAILS = os.environ.get("SHOW_MODEL_DETAILS", "").lower() == "true"
+if SHOW_MODEL_DETAILS:
+    logger.info("Model details logging enabled")
+
+# Enable LiteLLM debugging only in full debug mode
+if log_level == logging.DEBUG:
+    import litellm
+    litellm._turn_on_debug()
+    logger.info("LiteLLM debug mode enabled")
 
 # Configure uvicorn to be quieter
 import uvicorn
@@ -169,7 +183,9 @@ class Tool(BaseModel):
     input_schema: Dict[str, Any]
 
 class ThinkingConfig(BaseModel):
-    enabled: bool
+    enabled: bool = True
+    type: Optional[str] = None
+    budget_tokens: Optional[int] = None
 
 class MessagesRequest(BaseModel):
     model: str
@@ -531,20 +547,104 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                 
                 messages.append({"role": msg.role, "content": processed_content})
     
-    # Cap max_tokens for OpenAI models to their limit of 16384
+    # Use client-provided max_tokens value by default
     max_tokens = anthropic_request.max_tokens
-    if anthropic_request.model.startswith("openai/") or anthropic_request.model.startswith("gemini/"):
-        max_tokens = min(max_tokens, 16384)
-        logger.debug(f"Capping max_tokens to 16384 for OpenAI/Gemini model (original value: {anthropic_request.max_tokens})")
+    
+    # For logging only - don't modify the value
+    if SHOW_MODEL_DETAILS:
+        logger.info(f"Client requested max_tokens: {max_tokens}")
     
     # Create LiteLLM request dict
     litellm_request = {
         "model": anthropic_request.model,  # t understands "anthropic/claude-x" format
         "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": anthropic_request.temperature,
         "stream": anthropic_request.stream,
     }
+    
+    # Special handling for o3 and o4 models
+    if anthropic_request.model.startswith("openai/o3") or anthropic_request.model.startswith("openai/o4"):
+        # OpenAI o3/o4 models use max_completion_tokens instead of max_tokens
+        # For Claude Code, we should fully respect the client's token request
+        litellm_request["max_completion_tokens"] = max_tokens
+        
+        if SHOW_MODEL_DETAILS:
+            logger.info(f"Using max_completion_tokens={max_tokens} for {anthropic_request.model}")
+        
+        # Override system prompt for o3 models to experiment with its behavior
+        if anthropic_request.model.startswith("openai/o3"):
+            # Log the original system message if any
+            original_system = None
+            system_msg_idx = -1
+            
+            # Find any existing system message
+            for idx, msg in enumerate(litellm_request["messages"]):
+                if msg.get("role") == "system":
+                    system_msg_idx = idx
+                    original_system = msg.get("content")
+                    if original_system:
+                        # Print the full system prompt split into reasonably sized chunks for logging
+                        logger.info(f"📥 ORIGINAL SYSTEM PROMPT (FULL):")
+                        # Split into chunks of around 1000 chars for readability in logs
+                        chunk_size = 1000
+                        for i in range(0, len(original_system), chunk_size):
+                            chunk = original_system[i:i+chunk_size]
+                            logger.info(f"SYSTEM PROMPT PART {i//chunk_size + 1}: {chunk}")
+                    break
+            
+            # Instead of replacing, let's modify the existing system prompt by injecting personality guidelines
+            if original_system:
+                # Locate the tone instruction about being concise
+                concise_pattern = r"You should be concise, direct, and to the point"
+                
+                # Prepare the modified version with friendliness added
+                replacement = "You should be concise, direct, to the point, and also friendly and a good coworker"
+                
+                # Modify the original system prompt
+                modified_system_prompt = re.sub(concise_pattern, replacement, original_system)
+                
+                # Add some additional personality indicators at the end
+                personality_addendum = """\n\nADDITIONAL GUIDANCE: 
+1. When discussing code, be enthusiastic about helping. Use a friendly, conversational tone while maintaining professionalism.
+2. Express genuine interest in the user's projects and software engineering challenges.
+3. Remember that the user is a Pro member on an Enterprise account, paying a premium for your assistance.
+4. Demonstrate exceptional value with every response - be thorough, insightful, and go the extra mile.
+5. Provide thoughtful, well-reasoned responses that reflect your advanced capabilities.
+6. When appropriate, suggest improvements or optimizations beyond what was explicitly asked."""
+                
+                # Add the addendum only if it doesn't already exist
+                if "ADDITIONAL GUIDANCE" not in modified_system_prompt:
+                    modified_system_prompt += personality_addendum
+                
+                # Check if we actually made a change
+                if modified_system_prompt != original_system:
+                    logger.info(f"🔄 Modified system prompt: Added friendliness and personality guidance")
+                    
+                    # Update the system message with our modified version
+                    litellm_request["messages"][system_msg_idx]["content"] = modified_system_prompt
+                else:
+                    logger.info(f"⚠️ Could not modify system prompt - pattern not found")
+            else:
+                # No system prompt found, create a simple one
+                simple_prompt = "You are Claude, an AI assistant. You should be concise, direct, to the point, and also friendly and a good coworker. Provide useful, informative responses."
+                litellm_request["messages"].insert(0, {"role": "system", "content": simple_prompt})
+                logger.info(f"➕ Added a simple system prompt (no original found)")
+                
+            # Log all messages being sent (truncated for readability)
+            for i, msg in enumerate(litellm_request["messages"]):
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    content_preview = content[:100] + "..." if len(content) > 100 else content
+                    logger.info(f"📩 MESSAGE {i}: role={role}, content={content_preview}")
+        
+        # o3 and o4 models don't support custom temperature - they only support the default (1.0)
+        # Only add temperature if it's the default value of 1.0
+        if anthropic_request.temperature == 1.0:
+            litellm_request["temperature"] = 1.0
+    else:
+        # For other models, use standard parameters
+        litellm_request["max_tokens"] = max_tokens
+        litellm_request["temperature"] = anthropic_request.temperature
     
     # Add optional parameters if present
     if anthropic_request.stop_sequences:
@@ -1252,8 +1352,64 @@ async def create_message(
                     logger.warning(f"Message {i} has None content - replacing with placeholder")
                     litellm_request["messages"][i]["content"] = "..." # Fallback placeholder
         
-        # Only log basic info about the request, not the full details
-        logger.debug(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
+        # Log request information based on logging settings
+        if log_level == logging.DEBUG or SHOW_MODEL_DETAILS:
+            # Create a summary of the request
+            requested_model = request.model
+            actual_model = litellm_request.get('model')
+            is_streaming = litellm_request.get('stream', False)
+            msg_count = len(litellm_request.get('messages', []))
+            max_tokens_val = litellm_request.get('max_completion_tokens', litellm_request.get('max_tokens', 'unknown'))
+            
+            # Show a focused summary
+            request_summary = f"📤 REQUEST: From='{requested_model}' To='{actual_model}', Stream={is_streaming}, MaxTokens={max_tokens_val}, Messages={msg_count}"
+            
+            if SHOW_MODEL_DETAILS:
+                # If we're showing model details, log at INFO level
+                logger.info(request_summary)
+                
+                # Optionally show a preview of the last message
+                if msg_count > 0 and "messages" in litellm_request:
+                    last_msg = litellm_request["messages"][-1]
+                    role = last_msg.get("role", "unknown")
+                    content = last_msg.get("content", "")
+                    if isinstance(content, str):
+                        preview = content[:100] + ("..." if len(content) > 100 else "")
+                        logger.info(f"Last message ({role}): {preview}")
+            
+            # In full debug mode, log the detailed request
+            if log_level == logging.DEBUG:
+                # Create a safe copy of the request for logging with sensitive/large data truncated
+                log_request = litellm_request.copy()
+                
+                # Only log a sample of the messages to avoid overwhelming logs
+                if "messages" in log_request:
+                    sample_messages = []
+                    for i, msg in enumerate(log_request["messages"]):
+                        # For each message, include role and a preview of content
+                        sample_msg = {"role": msg.get("role", "unknown")}
+                        
+                        # Handle different content formats
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            # Show first 100 chars of string content
+                            sample_msg["content"] = content[:100] + ("..." if len(content) > 100 else "")
+                        elif isinstance(content, list):
+                            # For content blocks, just show count and types
+                            types = [block.get("type", "unknown") if isinstance(block, dict) else type(block).__name__ 
+                                    for block in content[:5]]
+                            sample_msg["content"] = f"[{len(content)} blocks: {', '.join(types)}...]"
+                        
+                        sample_messages.append(sample_msg)
+                    
+                    # Replace full messages with sample
+                    log_request["messages"] = sample_messages
+                
+                # Log the request details
+                logger.debug(f"DETAILED REQUEST: {json.dumps(log_request, indent=2)}")
+        else:
+            # Minimal info for normal mode
+            logger.debug(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
         
         # Handle streaming mode
         if request.stream:
@@ -1296,6 +1452,83 @@ async def create_message(
             # Convert LiteLLM response to Anthropic format
             anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
             
+            # Log response info based on logging settings
+            if log_level == logging.DEBUG or SHOW_MODEL_DETAILS:
+                # Extract the actual model used from the response
+                actual_model = None
+                model_response_details = {}
+                
+                # Extract detailed model info - this helps identify exactly which model responded
+                if hasattr(litellm_response, "__dict__"):
+                    for field in ["model", "id", "object", "created", "system_fingerprint", "model_version"]:
+                        if hasattr(litellm_response, field):
+                            model_response_details[field] = getattr(litellm_response, field)
+                
+                # Also try dict access for non-object responses
+                if isinstance(litellm_response, dict):
+                    for field in ["model", "id", "object", "created", "system_fingerprint", "model_version"]:
+                        if field in litellm_response and field not in model_response_details:
+                            model_response_details[field] = litellm_response[field]
+                
+                # Log the full model details JSON
+                if model_response_details:
+                    logger.info(f"🔍 DETAILED MODEL INFO: {json.dumps(model_response_details)}")
+                
+                # Set actual_model for normal logging flow
+                if "model" in model_response_details:
+                    actual_model = model_response_details["model"]
+                elif hasattr(litellm_response, "model"):
+                    actual_model = getattr(litellm_response, "model")
+                elif isinstance(litellm_response, dict) and "model" in litellm_response:
+                    actual_model = litellm_response["model"]
+                
+                # Extract content length - first try to get from anthropic_response
+                response_content = ""
+                if hasattr(anthropic_response, "content") and anthropic_response.content:
+                    for block in anthropic_response.content:
+                        if hasattr(block, "type") and block.type == "text" and hasattr(block, "text"):
+                            response_content += block.text
+                
+                # If nothing from anthropic_response, try litellm_response
+                if not response_content and hasattr(litellm_response, "choices") and litellm_response.choices:
+                    if hasattr(litellm_response.choices[0], "message") and hasattr(litellm_response.choices[0].message, "content"):
+                        response_content = litellm_response.choices[0].message.content
+                
+                # Show just the key information at INFO level
+                content_preview = response_content[:50] + "..." if response_content and len(response_content) > 50 else response_content
+                response_summary = f"📥 RESPONSE: Requested='{request.model}', Actual='{actual_model}', Content={len(response_content)} chars"
+                
+                if SHOW_MODEL_DETAILS:
+                    logger.info(f"{response_summary}\nPreview: {content_preview}")
+                else:
+                    logger.debug(f"{response_summary}\nPreview: {content_preview}")
+                
+                # In full debug mode, log the detailed response
+                if log_level == logging.DEBUG:
+                    # Create safe copy for logging with potential large fields truncated
+                    log_response = {}
+                    if hasattr(anthropic_response, "dict"):
+                        log_response = anthropic_response.dict()
+                    else:
+                        # Try to extract key fields if not a Pydantic model
+                        log_response = {
+                            "id": getattr(anthropic_response, "id", None),
+                            "model": getattr(anthropic_response, "model", None), 
+                            "role": getattr(anthropic_response, "role", None),
+                            "stop_reason": getattr(anthropic_response, "stop_reason", None),
+                        }
+                    
+                    # Truncate content for logging
+                    if "content" in log_response:
+                        if isinstance(log_response["content"], list):
+                            for i, block in enumerate(log_response["content"]):
+                                if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
+                                    text = block["text"]
+                                    if len(text) > 500:
+                                        log_response["content"][i]["text"] = text[:500] + "... [truncated]"
+                    
+                    logger.debug(f"DETAILED RESPONSE: {json.dumps(log_response, indent=2)}")
+            
             return anthropic_response
                 
     except Exception as e:
@@ -1319,6 +1552,15 @@ async def create_message(
             for key, value in e.__dict__.items():
                 if key not in error_details and key not in ['args', '__traceback__']:
                     error_details[key] = str(value)
+        
+        # Make error details JSON serializable by converting problematic objects to strings
+        for key, value in list(error_details.items()):
+            try:
+                # Test if value is JSON serializable
+                json.dumps({key: value})
+            except (TypeError, OverflowError):
+                # If not serializable, convert to string
+                error_details[key] = f"[Non-serializable {type(value).__name__}]: {str(value)}"
         
         # Log all error details
         logger.error(f"Error processing request: {json.dumps(error_details, indent=2)}")

@@ -76,6 +76,7 @@ The proxy automatically maps Claude model aliases and handles provider prefixes:
 |--------------|---------|
 | haiku | `SMALL_MODEL` environment variable (default: openai/gpt-4.1-mini) |
 | sonnet | `BIG_MODEL` environment variable (default: openai/gpt-4.1) |
+| thinker (invoked by thinking budget) | `THINKER_MODEL` environment variable (default: openai/gpt-4o) |
 
 ### Model Prefix Handling
 

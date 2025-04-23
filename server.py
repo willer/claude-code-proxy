@@ -100,6 +100,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 # These should include provider prefixes (e.g., "openai/gpt-4.1")
 BIG_MODEL = os.environ.get("BIG_MODEL", "openai/gpt-4.1")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "openai/gpt-4.1-mini")
+THINKER_MODEL = os.environ.get("THINKER_MODEL", "openai/gpt-4o")
 
 # Helper function to clean schema for Gemini
 def clean_gemini_schema(schema: Any) -> Any:
@@ -207,7 +208,18 @@ class MessagesRequest(BaseModel):
         # --- Mapping Logic --- END ---
 
         if mapped:
-            logger.debug(f"📌 MODEL MAPPING: '{original_model}' ➡️ '{new_model}'")
+            # Check if thinking is in the values dictionary for reasoning level
+            values = info.data
+            thinking_budget = None
+            if isinstance(values, dict) and 'thinking' in values and values['thinking']:
+                thinking_budget = getattr(values['thinking'], 'budget_tokens', None)
+            
+            # Add reasoning tier indicators if present
+            reasoning_level = ""
+            if thinking_budget:
+                reasoning_level = " (high)" if thinking_budget > 4096 else " (medium)"
+            
+            logger.debug(f"📌 MODEL MAPPING: '{original_model}{reasoning_level}' ➡️ '{new_model}{reasoning_level}'")
         else:
             # Don't modify the model name if it's already in provider/model format
             if '/' in v:
@@ -267,7 +279,18 @@ class TokenCountRequest(BaseModel):
         # --- Mapping Logic --- END ---
 
         if mapped:
-            logger.debug(f"📌 TOKEN COUNT MAPPING: '{original_model}' ➡️ '{new_model}'")
+            # Check if thinking is in the values dictionary for reasoning level
+            values = info.data
+            thinking_budget = None
+            if isinstance(values, dict) and 'thinking' in values and values['thinking']:
+                thinking_budget = getattr(values['thinking'], 'budget_tokens', None)
+            
+            # Add reasoning tier indicators if present
+            reasoning_level = ""
+            if thinking_budget:
+                reasoning_level = " (high)" if thinking_budget > 4096 else " (medium)"
+            
+            logger.debug(f"📌 TOKEN COUNT MAPPING: '{original_model}{reasoning_level}' ➡️ '{new_model}{reasoning_level}'")
         else:
             # Don't modify the model name if it's already in provider/model format
             if '/' in v:
@@ -559,7 +582,13 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                     modified_system_prompt = re.sub(pat, "", modified_system_prompt, flags=re.IGNORECASE)
                 
                 # Inject softer, friendlier guidance
-                personality_addendum = """\n\nADDITIONAL GUIDANCE:\n- Use a warm, conversational tone while remaining professional.\n- Feel free to elaborate when helpful; you are not limited to four lines.\n- Aim to be supportive, encouraging, and collaborative."""
+                personality_addendum = """
+
+ADDITIONAL GUIDANCE:
+- Use a warm, conversational, empathetic tone.
+- Offer positive affirmations and examples.
+- Invite follow-up questions and collaboration.
+- Remain supportive, clear, and patient."""
                 
                 if "ADDITIONAL GUIDANCE:" not in modified_system_prompt:
                     modified_system_prompt += personality_addendum
@@ -1149,6 +1178,23 @@ async def create_message(
         
         logger.debug(f"📊 PROCESSING REQUEST: Model={request.model}, Stream={request.stream}")
         
+        # Detect thinker mode and patch model if needed
+        thinking_budget = None
+        if hasattr(request, 'thinking') and request.thinking:
+            thinking_budget = getattr(request.thinking, 'budget_tokens', None)
+        reasoning_level = None
+        if thinking_budget:
+            reasoning_level = "high" if thinking_budget > 4096 else "medium"
+            patched_model = THINKER_MODEL
+            logger.info(f"THINKER mode triggered: routing to THINKER_MODEL ('{THINKER_MODEL}') with thinking budget {thinking_budget}")
+            request.model = THINKER_MODEL
+            # Optionally add a tag for OpenAI reasoning models
+            if 'openai/o3' in THINKER_MODEL or 'openai/o4' in THINKER_MODEL or 'gpt-4o' in THINKER_MODEL:
+                # Add reasoning tag if backend supports it
+                if not hasattr(request, 'metadata') or request.metadata is None:
+                    request.metadata = {}
+                request.metadata["reasoning"] = True
+                request.metadata["thinking_budget"] = thinking_budget
         # Convert Anthropic request to LiteLLM format
         litellm_request = convert_anthropic_to_litellm(request)
         
@@ -1368,6 +1414,7 @@ async def create_message(
         if request.stream:
             # Use LiteLLM for streaming
             num_tools = len(request.tools) if request.tools else 0
+            reasoning_level = "high" if thinking_budget and thinking_budget > 4096 else ("medium" if thinking_budget else None)
             
             log_request_beautifully(
                 "POST", 
@@ -1376,7 +1423,8 @@ async def create_message(
                 litellm_request.get('model'),
                 len(litellm_request['messages']),
                 num_tools,
-                200  # Assuming success at this point
+                200,  # Assuming success at this point
+                reasoning_level
             )
             # Ensure we use the async version for streaming
             response_generator = await litellm.acompletion(**litellm_request)
@@ -1396,7 +1444,8 @@ async def create_message(
                 litellm_request.get('model'),
                 len(litellm_request['messages']),
                 num_tools,
-                200  # Assuming success at this point
+                200,  # Assuming success at this point
+                reasoning_level
             )
             start_time = time.time()
             litellm_response = litellm.completion(**litellm_request)
@@ -1571,6 +1620,12 @@ async def count_tokens(
             # Log the request beautifully
             num_tools = len(request.tools) if request.tools else 0
             
+            # Check for thinking budget in the request
+            thinking_budget = None
+            if hasattr(request, 'thinking') and request.thinking:
+                thinking_budget = getattr(request.thinking, 'budget_tokens', None)
+            reasoning_level = "high" if thinking_budget and thinking_budget > 4096 else ("medium" if thinking_budget else None)
+            
             log_request_beautifully(
                 "POST",
                 raw_request.url.path,
@@ -1578,7 +1633,8 @@ async def count_tokens(
                 converted_request.get('model'),
                 len(converted_request['messages']),
                 num_tools,
-                200  # Assuming success at this point
+                200,  # Assuming success at this point
+                reasoning_level
             )
             
             # Add the appropriate API key based on the model prefix
@@ -1633,7 +1689,7 @@ class Colors:
     BOLD = "\033[1m"
     UNDERLINE = "\033[4m"
     DIM = "\033[2m"
-def log_request_beautifully(method, path, claude_model, openai_model, num_messages, num_tools, status_code):
+def log_request_beautifully(method, path, claude_model, openai_model, num_messages, num_tools, status_code, reasoning_level=None):
     """Log requests in a beautiful, twitter-friendly format showing Claude to OpenAI mapping."""
     # Format the Claude model name nicely
     claude_display = f"{Colors.CYAN}{claude_model}{Colors.RESET}"
@@ -1649,6 +1705,14 @@ def log_request_beautifully(method, path, claude_model, openai_model, num_messag
         openai_display = openai_display.split("/")[-1]
     openai_display = f"{Colors.GREEN}{openai_display}{Colors.RESET}"
     
+    # Append reasoning tier if provided
+    if reasoning_level:
+        # Colorize the reasoning level for better visibility
+        level_color = Colors.YELLOW if reasoning_level == "medium" else Colors.RED
+        reasoning_display = f" ({level_color}{reasoning_level}{Colors.RESET})"
+        claude_display += reasoning_display
+        openai_display += reasoning_display
+    
     # Format tools and messages
     tools_str = f"{Colors.MAGENTA}{num_tools} tools{Colors.RESET}"
     messages_str = f"{Colors.BLUE}{num_messages} messages{Colors.RESET}"
@@ -1656,7 +1720,6 @@ def log_request_beautifully(method, path, claude_model, openai_model, num_messag
     # Format status code
     status_str = f"{Colors.GREEN}✓ {status_code} OK{Colors.RESET}" if status_code == 200 else f"{Colors.RED}✗ {status_code}{Colors.RESET}"
     
-
     # Put it all together in a clear, beautiful format
     log_line = f"{Colors.BOLD}{method} {endpoint}{Colors.RESET} {status_str}"
     model_line = f"{claude_display} → {openai_display} {tools_str} {messages_str}"

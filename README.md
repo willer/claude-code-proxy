@@ -49,9 +49,9 @@ A proxy server that lets you use Anthropic clients with Gemini or OpenAI models 
 
 4. **Run the server**:
    ```bash
-   uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload
+   ./run-server.sh
    ```
-   *(`--reload` is optional, for development)*
+   *(the script sets sensible defaults, including `--reload`, and can be customised by editing environment variables inside)*
 
 ### Using with Claude Code 🎮
 

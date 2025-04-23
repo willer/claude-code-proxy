@@ -65,6 +65,15 @@ A proxy server that lets you use Anthropic clients with OpenAI, Gemini, or other
    ```bash
    ANTHROPIC_BASE_URL=http://localhost:8082 claude
    ```
+   
+   Or use the included `claudeo` script:
+   ```bash
+   # Add execute permissions
+   chmod +x claudeo
+   
+   # Run Claude with the proxy
+   ./claudeo
+   ```
 
 3. **That's it!** Your Claude Code client will now use the configured LiteLLM-supported models through the proxy. 🎯
 

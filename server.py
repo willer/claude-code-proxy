@@ -18,6 +18,38 @@ import sys
 # Load environment variables from .env file
 load_dotenv()
 
+# Cost per token fallback rates
+PRICES = {
+    "openai/o3":      {"input": 10.0/1e6, "output": 40.0/1e6},
+    "openai/o4-mini": {"input": 1.10/1e6, "output": 4.40/1e6},
+}
+
+def compute_cost(model: str, in_tokens: int, out_tokens: int) -> float | None:
+    """Return approximate USD cost for a request.
+
+    Priority order:
+    1. Hard‑coded fallback prices in the *PRICES* table (overrides anything else).
+    2. LiteLLM’s built‑in ``cost_per_token`` helper for every other model.
+    3. ``None`` if no pricing data are available.
+    """
+    # 1) Hard‑coded overrides
+    for key, rates in PRICES.items():
+        if model.startswith(key):
+            return in_tokens * rates["input"] + out_tokens * rates["output"]
+
+    # 2) Ask LiteLLM for the pricing of any other model
+    try:
+        prompt_cost, completion_cost = litellm.cost_per_token(
+            model=model,
+            prompt_tokens=in_tokens,
+            completion_tokens=out_tokens,
+        )
+        total = (prompt_cost or 0) + (completion_cost or 0)
+        return total if total > 0 else None  # treat 0 as "unknown / free"
+    except Exception:
+        # 3) Unsupported model or unexpected error – silently give up
+        return None
+
 # Configure logging based on environment variable
 log_level_str = os.environ.get("LOGLEVEL", "WARN").upper()
 log_level = getattr(logging, log_level_str, logging.WARN)
@@ -110,12 +142,38 @@ def clean_gemini_schema(schema: Any) -> Any:
         schema.pop("additionalProperties", None)
         schema.pop("default", None)
 
+        # Handle Union types - Gemini only supports Optional types
+        if "type" in schema and isinstance(schema["type"], list):
+            # Check if this is an Optional type (list with "null" as one of the types)
+            types = schema["type"]
+            if "null" in types and len(types) == 2:
+                # Keep the non-null type for Optional[Type]
+                non_null_type = next(t for t in types if t != "null")
+                schema["type"] = non_null_type
+                # Add nullable flag
+                schema["nullable"] = True
+            else:
+                # Non-Optional union types not supported - convert to string
+                logger.debug(f"Converting unsupported union type {types} to string for Gemini compatibility")
+                schema["type"] = "string"
+                schema.pop("items", None)  # Remove items if present
+                schema.pop("properties", None)  # Remove properties if present
+
         # Check for unsupported 'format' in string types
         if schema.get("type") == "string" and "format" in schema:
             allowed_formats = {"enum", "date-time"}
             if schema["format"] not in allowed_formats:
                 logger.debug(f"Removing unsupported format '{schema['format']}' for string type in Gemini schema.")
                 schema.pop("format")
+
+        # Special handling for anyOf, oneOf, allOf - not well supported by Gemini
+        for union_key in ["anyOf", "oneOf", "allOf"]:
+            if union_key in schema:
+                logger.debug(f"Converting unsupported {union_key} to string type for Gemini compatibility")
+                schema.pop(union_key)
+                schema["type"] = "string"
+                schema.pop("items", None)
+                schema.pop("properties", None)
 
         # Recursively clean nested schemas (properties, items, etc.)
         for key, value in list(schema.items()): # Use list() to allow modification during iteration
@@ -197,8 +255,18 @@ class MessagesRequest(BaseModel):
 
         # --- Mapping Logic --- START ---
         mapped = False
+        
+        # Special handling for passthrough mode - preserve original model
+        if BIG_MODEL == "passthrough" and ('claude' in clean_v.lower() or v.startswith('anthropic/')):
+            # Keep the original model for Anthropic models when in passthrough mode
+            logger.debug(f"Passthrough mode: preserving original model '{v}'")
+            new_model = v
+            if not v.startswith('anthropic/') and 'claude' in v.lower():
+                new_model = f"anthropic/{v}"
+                logger.debug(f"Adding anthropic/ prefix to model: '{v}' -> '{new_model}'")
+            mapped = True
         # Map Haiku to SMALL_MODEL
-        if 'haiku' in clean_v.lower():
+        elif 'haiku' in clean_v.lower():
             new_model = SMALL_MODEL
             mapped = True
         # Map Sonnet to BIG_MODEL
@@ -268,8 +336,18 @@ class TokenCountRequest(BaseModel):
 
         # --- Mapping Logic --- START ---
         mapped = False
+        
+        # Special handling for passthrough mode - preserve original model
+        if BIG_MODEL == "passthrough" and ('claude' in clean_v.lower() or v.startswith('anthropic/')):
+            # Keep the original model for Anthropic models when in passthrough mode
+            logger.debug(f"Passthrough mode: preserving original model '{v}'")
+            new_model = v
+            if not v.startswith('anthropic/') and 'claude' in v.lower():
+                new_model = f"anthropic/{v}"
+                logger.debug(f"Adding anthropic/ prefix to model: '{v}' -> '{new_model}'")
+            mapped = True
         # Map Haiku to SMALL_MODEL
-        if 'haiku' in clean_v.lower():
+        elif 'haiku' in clean_v.lower():
             new_model = SMALL_MODEL
             mapped = True
         # Map Sonnet to BIG_MODEL
@@ -317,6 +395,7 @@ class Usage(BaseModel):
     output_tokens: int
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
+    cost_usd: Optional[float] = None
 
 class MessagesResponse(BaseModel):
     id: str
@@ -588,7 +667,8 @@ ADDITIONAL GUIDANCE:
 - Use a warm, conversational, empathetic tone.
 - Offer positive affirmations and examples.
 - Invite follow-up questions and collaboration.
-- Remain supportive, clear, and patient."""
+- Remain supportive, clear, and patient.
+- Show eagerness to implement changes and iterate quickly."""
                 
                 if "ADDITIONAL GUIDANCE:" not in modified_system_prompt:
                     modified_system_prompt += personality_addendum
@@ -1100,7 +1180,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                             stop_reason = "end_turn"
                         
                         # Send message_delta with stop reason and usage
-                        usage = {"output_tokens": output_tokens}
+                        usage = {"input_tokens": input_tokens, "output_tokens": output_tokens, "cost_usd": compute_cost(original_request.model, input_tokens, output_tokens)}
                         
                         yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': usage})}\n\n"
                         
@@ -1126,7 +1206,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
             
             # Send final message_delta with usage
-            usage = {"output_tokens": output_tokens}
+            usage = {"input_tokens": input_tokens, "output_tokens": output_tokens, "cost_usd": compute_cost(original_request.model, input_tokens, output_tokens)}
             
             yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': usage})}\n\n"
             
@@ -1195,6 +1275,150 @@ async def create_message(
                     request.metadata = {}
                 request.metadata["reasoning"] = True
                 request.metadata["thinking_budget"] = thinking_budget
+        # Check if we need direct passthrough to Anthropic API
+        is_direct_anthropic = (BIG_MODEL == "passthrough" and 
+                             (request.model.startswith("anthropic/") or "claude" in request.model.lower()))
+        
+        # Handle direct passthrough to Anthropic API (bypassing LiteLLM)
+        if is_direct_anthropic:
+            logger.info(f"📌 TRUE PASSTHROUGH: sending request directly to Anthropic API for {request.model}")
+            
+            # Ensure model has anthropic/ prefix if needed
+            model_name = request.model
+            if not model_name.startswith("anthropic/") and "claude" in model_name.lower():
+                model_name = f"anthropic/{model_name}"
+                logger.debug(f"Added anthropic/ prefix to model: {request.model} -> {model_name}")
+            
+            # For streaming requests, use direct Anthropic API streaming
+            if request.stream:
+                try:
+                    # Create direct Anthropic request
+                    api_url = "https://api.anthropic.com/v1/messages"
+                    
+                    # Dump the original request to JSON (preserving Anthropic format)
+                    # Use dictionary to ensure we don't modify the original request's model
+                    request_dict = request.dict(exclude_none=True, exclude_unset=True)
+                    request_dict["model"] = model_name.replace("anthropic/", "")  # Remove prefix for API
+                    
+                    # Remove empty or null fields that might cause API errors
+                    # Specifically, don't send tool_choice if tools is not present
+                    if "tool_choice" in request_dict and (not request_dict.get("tools") or len(request_dict.get("tools", [])) == 0):
+                        logger.debug("Removing tool_choice from request as tools array is empty")
+                        request_dict.pop("tool_choice", None)
+                        
+                    # Remove any other null or empty fields
+                    for key in list(request_dict.keys()):
+                        if request_dict[key] is None or (isinstance(request_dict[key], (list, dict)) and len(request_dict[key]) == 0):
+                            logger.debug(f"Removing empty field from request: {key}")
+                            request_dict.pop(key)
+                    
+                    headers = {
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    }
+                    
+                    # Log the beautiful request
+                    num_tools = len(request.tools) if request.tools else 0
+                    reasoning_level = "high" if thinking_budget and thinking_budget > 4096 else ("medium" if thinking_budget else None)
+                    log_request_beautifully(
+                        "POST", 
+                        raw_request.url.path, 
+                        request.model, 
+                        "DIRECT to Anthropic",
+                        len(request.messages),
+                        num_tools,
+                        200,
+                        reasoning_level
+                    )
+                    
+                    # Use httpx for async streaming
+                    async def direct_anthropic_stream():
+                        async with httpx.AsyncClient() as client:
+                            async with client.stream("POST", api_url, json=request_dict, headers=headers) as response:
+                                # Forward status code if there's an error
+                                if response.status_code != 200:
+                                    error_body = await response.aread()
+                                    raise HTTPException(
+                                        status_code=response.status_code,
+                                        detail=f"Anthropic API error: {error_body.decode()}"
+                                    )
+                                
+                                # Stream the response directly
+                                async for chunk in response.aiter_bytes():
+                                    yield chunk
+                    
+                    # Return the streaming response directly
+                    return StreamingResponse(
+                        direct_anthropic_stream(),
+                        media_type="text/event-stream"
+                    )
+                
+                except Exception as e:
+                    logger.error(f"Error in direct Anthropic streaming: {str(e)}")
+                    raise HTTPException(status_code=500, detail=f"Error in direct Anthropic API call: {str(e)}")
+                
+            else:
+                # For non-streaming requests, use direct Anthropic API
+                try:
+                    # Create direct Anthropic request
+                    api_url = "https://api.anthropic.com/v1/messages"
+                    
+                    # Dump the original request to JSON (preserving Anthropic format)
+                    request_dict = request.dict(exclude_none=True, exclude_unset=True)
+                    request_dict["model"] = model_name.replace("anthropic/", "")  # Remove prefix for API
+                    
+                    # Remove empty or null fields that might cause API errors
+                    # Specifically, don't send tool_choice if tools is not present
+                    if "tool_choice" in request_dict and (not request_dict.get("tools") or len(request_dict.get("tools", [])) == 0):
+                        logger.debug("Removing tool_choice from request as tools array is empty")
+                        request_dict.pop("tool_choice", None)
+                        
+                    # Remove any other null or empty fields
+                    for key in list(request_dict.keys()):
+                        if request_dict[key] is None or (isinstance(request_dict[key], (list, dict)) and len(request_dict[key]) == 0):
+                            logger.debug(f"Removing empty field from request: {key}")
+                            request_dict.pop(key)
+                    
+                    headers = {
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    }
+                    
+                    # Log the beautiful request
+                    num_tools = len(request.tools) if request.tools else 0
+                    reasoning_level = "high" if thinking_budget and thinking_budget > 4096 else ("medium" if thinking_budget else None)
+                    log_request_beautifully(
+                        "POST", 
+                        raw_request.url.path, 
+                        request.model, 
+                        "DIRECT to Anthropic",
+                        len(request.messages),
+                        num_tools,
+                        200,
+                        reasoning_level
+                    )
+                    
+                    # Use httpx for async request
+                    async with httpx.AsyncClient() as client:
+                        response = await client.post(api_url, json=request_dict, headers=headers)
+                        
+                        # Check for errors
+                        if response.status_code != 200:
+                            raise HTTPException(
+                                status_code=response.status_code,
+                                detail=f"Anthropic API error: {response.text}"
+                            )
+                        
+                        # Return the response directly
+                        return response.json()
+                
+                except Exception as e:
+                    logger.error(f"Error in direct Anthropic API call: {str(e)}")
+                    raise HTTPException(status_code=500, detail=f"Error in direct Anthropic API call: {str(e)}")
+        
+        # Standard non-passthrough flow using LiteLLM
         # Convert Anthropic request to LiteLLM format
         litellm_request = convert_anthropic_to_litellm(request)
         
@@ -1453,6 +1677,10 @@ async def create_message(
             
             # Convert LiteLLM response to Anthropic format
             anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
+            # Compute and attach cost
+            in_toks = anthropic_response.usage.input_tokens
+            out_toks = anthropic_response.usage.output_tokens
+            anthropic_response.usage.cost_usd = compute_cost(request.model, in_toks, out_toks)
             
             # Log response info based on logging settings
             if log_level == logging.DEBUG or SHOW_MODEL_DETAILS:
@@ -1599,7 +1827,66 @@ async def count_tokens(
         elif clean_model.startswith("openai/"):
             clean_model = clean_model[len("openai/"):]
         
-        # Convert the messages to a format LiteLLM can understand
+        # Check if we need direct passthrough to Anthropic for token counting
+        is_direct_anthropic = (BIG_MODEL == "passthrough" and 
+                             (request.model.startswith("anthropic/") or "claude" in request.model.lower()))
+        
+        # Handle direct passthrough to Anthropic API for token counting
+        if is_direct_anthropic:
+            logger.info(f"📌 TRUE PASSTHROUGH: token counting directly with Anthropic API for {request.model}")
+            
+            # Ensure model has anthropic/ prefix if needed
+            model_name = request.model
+            if not model_name.startswith("anthropic/") and "claude" in model_name.lower():
+                model_name = f"anthropic/{model_name}"
+                logger.debug(f"Added anthropic/ prefix to model: {request.model} -> {model_name}")
+            
+            try:
+                # Create direct Anthropic request
+                api_url = "https://api.anthropic.com/v1/messages/count_tokens"
+                
+                # Dump the original request to JSON (preserving Anthropic format)
+                request_dict = request.dict(exclude_none=True, exclude_unset=True)
+                request_dict["model"] = model_name.replace("anthropic/", "")  # Remove prefix for API
+                
+                # Remove empty or null fields that might cause API errors
+                # Specifically, don't send tool_choice if tools is not present
+                if "tool_choice" in request_dict and (not request_dict.get("tools") or len(request_dict.get("tools", [])) == 0):
+                    logger.debug("Removing tool_choice from request as tools array is empty")
+                    request_dict.pop("tool_choice", None)
+                    
+                # Remove any other null or empty fields
+                for key in list(request_dict.keys()):
+                    if request_dict[key] is None or (isinstance(request_dict[key], (list, dict)) and len(request_dict[key]) == 0):
+                        logger.debug(f"Removing empty field from request: {key}")
+                        request_dict.pop(key)
+                
+                headers = {
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                }
+                
+                # Use httpx for async request
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(api_url, json=request_dict, headers=headers)
+                    
+                    # Check for errors
+                    if response.status_code != 200:
+                        raise HTTPException(
+                            status_code=response.status_code,
+                            detail=f"Anthropic token counting error: {response.text}"
+                        )
+                    
+                    # Return the token count directly
+                    token_count_data = response.json()
+                    return TokenCountResponse(input_tokens=token_count_data.get("input_tokens", 0))
+            
+            except Exception as e:
+                logger.error(f"Error in direct Anthropic token counting: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Error in direct Anthropic token counting: {str(e)}")
+        
+        # Standard non-passthrough flow using LiteLLM
         converted_request = convert_anthropic_to_litellm(
             MessagesRequest(
                 model=request.model,

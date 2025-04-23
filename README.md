@@ -87,6 +87,9 @@ The proxy automatically maps Claude model aliases and handles provider prefixes:
 | sonnet | `BIG_MODEL` environment variable (default: openai/gpt-4.1) |
 | thinker (invoked by thinking budget) | `THINKER_MODEL` environment variable (default: openai/gpt-4o) |
 
+**Special Values:**
+- Setting `BIG_MODEL="passthrough"` enables a special mode where all Claude/Anthropic models bypass LiteLLM and go directly to the Anthropic API. This preserves all original request parameters and ensures maximum compatibility.
+
 ### Model Prefix Handling
 
 Models can be specified with explicit provider prefixes to control which provider they use:
@@ -130,19 +133,34 @@ BIG_MODEL="openai/gpt-4o" # Maps 'sonnet' to GPT-4o
 SMALL_MODEL="openai/gpt-4o-mini" # Maps 'haiku' to GPT-4o-mini
 ```
 
+**Example 4: Passthrough Mode for Direct Anthropic API Access**
+```dotenv
+ANTHROPIC_API_KEY="your-anthropic-key" # Required for passthrough mode
+OPENAI_API_KEY="your-openai-key" # Needed for non-Anthropic models
+BIG_MODEL="passthrough" # Special value that bypasses LiteLLM for Anthropic models
+SMALL_MODEL="openai/gpt-4o-mini" # Maps 'haiku' to GPT-4o-mini
+```
+
 ## How It Works 🧩
 
 This proxy works by:
 
 1. **Receiving requests** in Anthropic's API format 📥
 2. **Processing model names** to handle provider prefixes and Claude aliases 🔄
+
+**For normal mode (using LiteLLM):**
 3. **Translating** the requests to LiteLLM format (with appropriate provider prefixes) 🔄 
 4. **Selecting** the appropriate API key based on the provider prefix 🔑
 5. **Sending** the translated request to the selected backend via LiteLLM 📤
 6. **Converting** the response back to Anthropic format 🔄
-7. **Returning** the formatted response to the client ✅
 
-The proxy handles both streaming and non-streaming responses, maintaining compatibility with all Claude clients while providing access to any model supported by LiteLLM. 🌊
+**For passthrough mode (when BIG_MODEL="passthrough"):**
+3. **Detecting** Anthropic model requests and bypassing LiteLLM 🚦
+4. **Cleaning** the request to ensure API compatibility 🧹
+5. **Forwarding** the request directly to the Anthropic API 📤
+6. **Returning** the native Anthropic response to the client ✅
+
+The proxy handles both streaming and non-streaming responses, maintaining compatibility with all Claude clients while providing access to any model supported by LiteLLM or direct Anthropic API access. 🌊
 
 ## Contributing 🤝
 

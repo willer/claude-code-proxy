@@ -1,8 +1,8 @@
-# Anthropic API Proxy for Gemini & OpenAI Models 🔄
+# Anthropic API Proxy for LiteLLM Models 🔄
 
-**Use Anthropic clients (like Claude Code) with Gemini or OpenAI backends.** 🤝
+**Use Anthropic clients (like Claude Code) with any LiteLLM-supported model.** 🤝
 
-A proxy server that lets you use Anthropic clients with Gemini or OpenAI models via LiteLLM. 🌉
+A proxy server that lets you use Anthropic clients with OpenAI, Gemini, or other models supported by LiteLLM. 🌉
 
 
 ![Anthropic API Proxy](pic.png)
@@ -37,15 +37,16 @@ A proxy server that lets you use Anthropic clients with Gemini or OpenAI models 
    Edit `.env` and fill in your API keys and model configurations:
 
    *   `ANTHROPIC_API_KEY`: (Optional) Needed only if proxying *to* Anthropic models.
-   *   `OPENAI_API_KEY`: Your OpenAI API key (Required if using the default OpenAI preference or as fallback).
-   *   `GEMINI_API_KEY`: Your Google AI Studio (Gemini) API key (Required if PREFERRED_PROVIDER=google).
-   *   `PREFERRED_PROVIDER` (Optional): Set to `openai` (default) or `google`. This determines the primary backend for mapping `haiku`/`sonnet`.
-   *   `BIG_MODEL` (Optional): The model to map `sonnet` requests to. Defaults to `gpt-4.1` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.5-pro-preview-03-25`.
-   *   `SMALL_MODEL` (Optional): The model to map `haiku` requests to. Defaults to `gpt-4.1-mini` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.0-flash`.
+   *   `OPENAI_API_KEY`: Your OpenAI API key (Required for OpenAI models).
+   *   `GEMINI_API_KEY`: Your Google AI Studio (Gemini) API key (Required for Gemini models).
+   *   `BIG_MODEL` (Optional): The full model identifier (including provider prefix) to map `sonnet` requests to. Defaults to `openai/gpt-4.1`.
+   *   `SMALL_MODEL` (Optional): The full model identifier (including provider prefix) to map `haiku` requests to. Defaults to `openai/gpt-4.1-mini`.
 
    **Mapping Logic:**
-   - If `PREFERRED_PROVIDER=openai` (default), `haiku`/`sonnet` map to `SMALL_MODEL`/`BIG_MODEL` prefixed with `openai/`.
-   - If `PREFERRED_PROVIDER=google`, `haiku`/`sonnet` map to `SMALL_MODEL`/`BIG_MODEL` prefixed with `gemini/` *if* those models are in the server's known `GEMINI_MODELS` list (otherwise falls back to OpenAI mapping).
+   - `haiku` requests map to the model specified in `SMALL_MODEL`
+   - `sonnet` requests map to the model specified in `BIG_MODEL`
+   - Models without a provider prefix are automatically prefixed with `openai/`
+   - Models with existing provider prefixes (`openai/`, `gemini/`, `anthropic/`) are used as-is
 
 4. **Run the server**:
    ```bash
@@ -65,80 +66,58 @@ A proxy server that lets you use Anthropic clients with Gemini or OpenAI models 
    ANTHROPIC_BASE_URL=http://localhost:8082 claude
    ```
 
-3. **That's it!** Your Claude Code client will now use the configured backend models (defaulting to Gemini) through the proxy. 🎯
+3. **That's it!** Your Claude Code client will now use the configured LiteLLM-supported models through the proxy. 🎯
 
 ## Model Mapping 🗺️
 
-The proxy automatically maps Claude models to either OpenAI or Gemini models based on the configured model:
+The proxy automatically maps Claude model aliases and handles provider prefixes:
 
-| Claude Model | Default Mapping | When BIG_MODEL/SMALL_MODEL is a Gemini model |
-|--------------|--------------|---------------------------|
-| haiku | openai/gpt-4o-mini | gemini/[model-name] |
-| sonnet | openai/gpt-4o | gemini/[model-name] |
-
-### Supported Models
-
-#### OpenAI Models
-The following OpenAI models are supported with automatic `openai/` prefix handling:
-- o3-mini
-- o1
-- o1-mini
-- o1-pro
-- gpt-4.5-preview
-- gpt-4o
-- gpt-4o-audio-preview
-- chatgpt-4o-latest
-- gpt-4o-mini
-- gpt-4o-mini-audio-preview
-- gpt-4.1
-- gpt-4.1-mini
-
-#### Gemini Models
-The following Gemini models are supported with automatic `gemini/` prefix handling:
-- gemini-2.5-pro-preview-03-25
-- gemini-2.0-flash
+| Claude Model | Maps To |
+|--------------|---------|
+| haiku | `SMALL_MODEL` environment variable (default: openai/gpt-4.1-mini) |
+| sonnet | `BIG_MODEL` environment variable (default: openai/gpt-4.1) |
 
 ### Model Prefix Handling
-The proxy automatically adds the appropriate prefix to model names:
-- OpenAI models get the `openai/` prefix 
-- Gemini models get the `gemini/` prefix
-- The BIG_MODEL and SMALL_MODEL will get the appropriate prefix based on whether they're in the OpenAI or Gemini model lists
 
-For example:
+Models can be specified with explicit provider prefixes to control which provider they use:
+
+- `openai/gpt-4o` - Uses OpenAI's GPT-4o model
+- `gemini/gemini-2.5-pro` - Uses Gemini's 2.5 Pro model
+- `anthropic/claude-3-opus` - Uses Anthropic's Claude 3 Opus model
+
+Models without a prefix automatically get the `openai/` prefix added:
+
 - `gpt-4o` becomes `openai/gpt-4o`
-- `gemini-2.5-pro-preview-03-25` becomes `gemini/gemini-2.5-pro-preview-03-25`
-- When BIG_MODEL is set to a Gemini model, Claude Sonnet will map to `gemini/[model-name]`
+- `gpt-4.1-mini` becomes `openai/gpt-4.1-mini`
+
+The API selects the appropriate backend and API key based on the provider prefix in the model name.
 
 ### Customizing Model Mapping
 
 Control the mapping using environment variables in your `.env` file or directly:
 
-**Example 1: Default (Use OpenAI)**
-No changes needed in `.env` beyond API keys, or ensure:
+**Example 1: Default Setup**
 ```dotenv
 OPENAI_API_KEY="your-openai-key"
-GEMINI_API_KEY="your-google-key" # Needed if PREFERRED_PROVIDER=google
-# PREFERRED_PROVIDER="openai" # Optional, it's the default
-# BIG_MODEL="gpt-4.1" # Optional, it's the default
-# SMALL_MODEL="gpt-4.1-mini" # Optional, it's the default
+GEMINI_API_KEY="your-google-key" # Needed only for gemini/ models
+ANTHROPIC_API_KEY="your-anthropic-key" # Needed only for anthropic/ models
+# BIG_MODEL="openai/gpt-4.1" # Optional, it's the default
+# SMALL_MODEL="openai/gpt-4.1-mini" # Optional, it's the default
 ```
 
-**Example 2: Prefer Google**
+**Example 2: Use Gemini Models for Claude Aliases**
 ```dotenv
-GEMINI_API_KEY="your-google-key"
-OPENAI_API_KEY="your-openai-key" # Needed for fallback
-PREFERRED_PROVIDER="google"
-# BIG_MODEL="gemini-2.5-pro-preview-03-25" # Optional, it's the default for Google pref
-# SMALL_MODEL="gemini-2.0-flash" # Optional, it's the default for Google pref
+OPENAI_API_KEY="your-openai-key" # Needed for openai/ models
+GEMINI_API_KEY="your-google-key" # Needed for gemini/ models
+BIG_MODEL="gemini/gemini-2.5-pro-preview-03-25" # Maps 'sonnet' to Gemini
+SMALL_MODEL="gemini/gemini-2.0-flash" # Maps 'haiku' to Gemini
 ```
 
 **Example 3: Use Specific OpenAI Models**
 ```dotenv
 OPENAI_API_KEY="your-openai-key"
-GEMINI_API_KEY="your-google-key"
-PREFERRED_PROVIDER="openai"
-BIG_MODEL="gpt-4o" # Example specific model
-SMALL_MODEL="gpt-4o-mini" # Example specific model
+BIG_MODEL="openai/gpt-4o" # Maps 'sonnet' to GPT-4o
+SMALL_MODEL="openai/gpt-4o-mini" # Maps 'haiku' to GPT-4o-mini
 ```
 
 ## How It Works 🧩
@@ -146,12 +125,14 @@ SMALL_MODEL="gpt-4o-mini" # Example specific model
 This proxy works by:
 
 1. **Receiving requests** in Anthropic's API format 📥
-2. **Translating** the requests to OpenAI format via LiteLLM 🔄
-3. **Sending** the translated request to OpenAI 📤
-4. **Converting** the response back to Anthropic format 🔄
-5. **Returning** the formatted response to the client ✅
+2. **Processing model names** to handle provider prefixes and Claude aliases 🔄
+3. **Translating** the requests to LiteLLM format (with appropriate provider prefixes) 🔄 
+4. **Selecting** the appropriate API key based on the provider prefix 🔑
+5. **Sending** the translated request to the selected backend via LiteLLM 📤
+6. **Converting** the response back to Anthropic format 🔄
+7. **Returning** the formatted response to the client ✅
 
-The proxy handles both streaming and non-streaming responses, maintaining compatibility with all Claude clients. 🌊
+The proxy handles both streaming and non-streaming responses, maintaining compatibility with all Claude clients while providing access to any model supported by LiteLLM. 🌊
 
 ## Contributing 🤝
 

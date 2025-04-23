@@ -17,7 +17,7 @@ export SHOW_MODEL_DETAILS=true
 # Set default model configuration
 export THINKER_MODEL="${BIG_MODEL:-openai/o3}"
 export BIG_MODEL="${BIG_MODEL:-openai/o4-mini}"
-export SMALL_MODEL="${SMALL_MODEL:-openai/gpt-4o}"
+export SMALL_MODEL="${SMALL_MODEL:-openai/gpt-4o-mini}"
 
 # Print server startup info
 echo "Starting server with BIG_MODEL=$BIG_MODEL, SMALL_MODEL=$SMALL_MODEL"

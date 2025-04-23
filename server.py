@@ -1655,8 +1655,7 @@ async def count_tokens(
             # Count tokens
             token_count = token_counter(
                 model=converted_request["model"],
-                messages=converted_request["messages"],
-                api_key=api_key
+                messages=converted_request["messages"]
             )
             
             # Return Anthropic-style response

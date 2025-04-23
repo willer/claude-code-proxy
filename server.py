@@ -596,23 +596,22 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                 # Locate the tone instruction about being concise
                 concise_pattern = r"You should be concise, direct, and to the point"
                 
-                # Prepare the modified version with friendliness added
                 replacement = "You should be concise, direct, to the point, and also friendly and a good coworker"
                 
-                # Modify the original system prompt
                 modified_system_prompt = re.sub(concise_pattern, replacement, original_system)
                 
-                # Add some additional personality indicators at the end
-                personality_addendum = """\n\nADDITIONAL GUIDANCE: 
-1. When discussing code, be enthusiastic about helping. Use a friendly, conversational tone while maintaining professionalism.
-2. Express genuine interest in the user's projects and software engineering challenges.
-3. Remember that the user is a Pro member on an Enterprise account, paying a premium for your assistance.
-4. Demonstrate exceptional value with every response - be thorough, insightful, and go the extra mile.
-5. Provide thoughtful, well-reasoned responses that reflect your advanced capabilities.
-6. When appropriate, suggest improvements or optimizations beyond what was explicitly asked."""
+                # Remove overly strict brevity constraints
+                brevity_patterns = [
+                    r"You MUST answer concisely with fewer than 4 lines[^\n]*\n?",
+                    r"One word answers are best\.?:?[^\n]*\n?"
+                ]
+                for pat in brevity_patterns:
+                    modified_system_prompt = re.sub(pat, "", modified_system_prompt, flags=re.IGNORECASE)
                 
-                # Add the addendum only if it doesn't already exist
-                if "ADDITIONAL GUIDANCE" not in modified_system_prompt:
+                # Inject softer, friendlier guidance
+                personality_addendum = """\n\nADDITIONAL GUIDANCE:\n- Use a warm, conversational tone while remaining professional.\n- Feel free to elaborate when helpful; you are not limited to four lines.\n- Aim to be supportive, encouraging, and collaborative."""
+                
+                if "ADDITIONAL GUIDANCE:" not in modified_system_prompt:
                     modified_system_prompt += personality_addendum
                 
                 # Check if we actually made a change

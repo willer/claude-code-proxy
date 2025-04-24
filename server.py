@@ -128,6 +128,11 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+# Log API key status (without revealing actual keys)
+logger.info(f"API Keys Configured: Anthropic={'✓ YES' if ANTHROPIC_API_KEY else '✗ NO'}, " +
+           f"OpenAI={'✓ YES' if OPENAI_API_KEY else '✗ NO'}, " +
+           f"Gemini={'✓ YES' if GEMINI_API_KEY else '✗ NO'}")
+
 # Get model mapping configuration from environment
 # These should include provider prefixes (e.g., "openai/gpt-4.1")
 BIG_MODEL = os.environ.get("BIG_MODEL", "openai/gpt-4.1")
@@ -1312,8 +1317,29 @@ async def create_message(
                             logger.debug(f"Removing empty field from request: {key}")
                             request_dict.pop(key)
                     
+                    # Extract client's API key from headers if available
+                    client_api_key = None
+                    client_headers = dict(raw_request.headers.items())
+                    if "x-api-key" in client_headers:
+                        client_api_key = client_headers["x-api-key"]
+                        logger.debug("Using client's API key from request headers")
+                    elif "authorization" in client_headers:
+                        auth_header = client_headers.get("authorization", "")
+                        if auth_header.startswith("Bearer "):
+                            client_api_key = auth_header.replace("Bearer ", "")
+                            logger.debug("Using client's API key from Authorization header")
+                    
+                    # Use client's key if available, fall back to server's key
+                    api_key = client_api_key or ANTHROPIC_API_KEY
+                    if not api_key:
+                        raise HTTPException(
+                            status_code=401,
+                            detail="No API key found for Anthropic. Please provide an API key in the request headers or set ANTHROPIC_API_KEY in environment variables."
+                        )
+                    
+                    # Create headers with the appropriate API key
                     headers = {
-                        "x-api-key": ANTHROPIC_API_KEY,
+                        "x-api-key": api_key,
                         "anthropic-version": "2023-06-01",
                         "content-type": "application/json",
                     }
@@ -1411,8 +1437,29 @@ async def create_message(
                             logger.debug(f"Removing empty field from request: {key}")
                             request_dict.pop(key)
                     
+                    # Extract client's API key from headers if available
+                    client_api_key = None
+                    client_headers = dict(raw_request.headers.items())
+                    if "x-api-key" in client_headers:
+                        client_api_key = client_headers["x-api-key"]
+                        logger.debug("Using client's API key from request headers")
+                    elif "authorization" in client_headers:
+                        auth_header = client_headers.get("authorization", "")
+                        if auth_header.startswith("Bearer "):
+                            client_api_key = auth_header.replace("Bearer ", "")
+                            logger.debug("Using client's API key from Authorization header")
+                    
+                    # Use client's key if available, fall back to server's key
+                    api_key = client_api_key or ANTHROPIC_API_KEY
+                    if not api_key:
+                        raise HTTPException(
+                            status_code=401,
+                            detail="No API key found for Anthropic. Please provide an API key in the request headers or set ANTHROPIC_API_KEY in environment variables."
+                        )
+                    
+                    # Create headers with the appropriate API key
                     headers = {
-                        "x-api-key": ANTHROPIC_API_KEY,
+                        "x-api-key": api_key,
                         "anthropic-version": "2023-06-01",
                         "content-type": "application/json",
                     }
@@ -1924,8 +1971,29 @@ async def count_tokens(
                         logger.debug(f"Removing empty field from request: {key}")
                         request_dict.pop(key)
                 
+                # Extract client's API key from headers if available
+                client_api_key = None
+                client_headers = dict(raw_request.headers.items())
+                if "x-api-key" in client_headers:
+                    client_api_key = client_headers["x-api-key"]
+                    logger.debug("Using client's API key from request headers for token counting")
+                elif "authorization" in client_headers:
+                    auth_header = client_headers.get("authorization", "")
+                    if auth_header.startswith("Bearer "):
+                        client_api_key = auth_header.replace("Bearer ", "")
+                        logger.debug("Using client's API key from Authorization header for token counting")
+                
+                # Use client's key if available, fall back to server's key
+                api_key = client_api_key or ANTHROPIC_API_KEY
+                if not api_key:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="No API key found for Anthropic token counting. Please provide an API key in the request headers or set ANTHROPIC_API_KEY in environment variables."
+                    )
+                
+                # Create headers with the appropriate API key
                 headers = {
-                    "x-api-key": ANTHROPIC_API_KEY,
+                    "x-api-key": api_key,
                     "anthropic-version": "2023-06-01",
                     "content-type": "application/json",
                 }

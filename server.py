@@ -1303,7 +1303,28 @@ async def create_message(
                     # Dump the original request to JSON (preserving Anthropic format)
                     # Use dictionary to ensure we don't modify the original request's model
                     request_dict = request.dict(exclude_none=True, exclude_unset=True)
-                    request_dict["model"] = model_name.replace("anthropic/", "")  # Remove prefix for API
+                    
+                    # Extract client headers first to avoid reference before assignment
+                    client_headers = dict(raw_request.headers.items())
+                    
+                    # Normalize header keys to lowercase for consistent lookup
+                    client_headers_normalized = {k.lower(): v for k, v in client_headers.items()}
+                    client_headers = {**client_headers, **client_headers_normalized}
+                    
+                    # Handle model name format based on API used:
+                    # - Claude Max (auth token present) may use full model name without removing prefixes
+                    # - Regular Anthropic API needs the "anthropic/" prefix removed
+                    if "authorization" in client_headers and client_headers["authorization"].startswith("Bearer "):
+                        # For Claude Max, use the original model requested
+                        # Claude Max uses original model names like "claude-3-7-sonnet-20250219"
+                        original_model = request.original_model if hasattr(request, "original_model") and request.original_model else request.model
+                        model_no_prefix = original_model.replace("anthropic/", "")
+                        request_dict["model"] = model_no_prefix
+                        logger.debug(f"Using original model for Claude Max streaming: {model_no_prefix}")
+                    else:
+                        # Regular Anthropic API needs the "anthropic/" prefix removed
+                        request_dict["model"] = model_name.replace("anthropic/", "")
+                        logger.debug(f"Using model for regular API streaming: {request_dict['model']}")
                     
                     # Remove empty or null fields that might cause API errors
                     # Specifically, don't send tool_choice if tools is not present
@@ -1317,17 +1338,33 @@ async def create_message(
                             logger.debug(f"Removing empty field from request: {key}")
                             request_dict.pop(key)
                     
-                    # Extract client's API key from headers if available
+                    # Extract ALL authentication related headers from the client request
                     client_api_key = None
                     client_headers = dict(raw_request.headers.items())
+                    
+                    # Normalize header keys to lowercase for consistent lookup
+                    client_headers_normalized = {k.lower(): v for k, v in client_headers.items()}
+                    client_headers = {**client_headers, **client_headers_normalized}
+                    
+                    # Debug: log all headers in passthrough mode (with sensitive values redacted)
+                    if log_level == logging.DEBUG:
+                        safe_headers = {k: ("**REDACTED**" if k.lower() in ["x-api-key", "authorization"] else v) 
+                                     for k, v in client_headers.items()}
+                        logger.debug(f"Passthrough mode: Received headers: {json.dumps(safe_headers)}")
+                    
+                    # Try all possible API key header variations
                     if "x-api-key" in client_headers:
                         client_api_key = client_headers["x-api-key"]
-                        logger.debug("Using client's API key from request headers")
+                        logger.debug("Found client's API key in x-api-key header")
                     elif "authorization" in client_headers:
                         auth_header = client_headers.get("authorization", "")
                         if auth_header.startswith("Bearer "):
                             client_api_key = auth_header.replace("Bearer ", "")
-                            logger.debug("Using client's API key from Authorization header")
+                            logger.debug("Found client's API key in Authorization Bearer header")
+                    # Claude Max might use different headers
+                    elif "anthropic-api-key" in client_headers:
+                        client_api_key = client_headers["anthropic-api-key"]
+                        logger.debug("Found client's API key in anthropic-api-key header")
                     
                     # Use client's key if available, fall back to server's key
                     api_key = client_api_key or ANTHROPIC_API_KEY
@@ -1337,12 +1374,49 @@ async def create_message(
                             detail="No API key found for Anthropic. Please provide an API key in the request headers or set ANTHROPIC_API_KEY in environment variables."
                         )
                     
-                    # Create headers with the appropriate API key
+                    # Create headers using the most updated API version for Claude Max support
                     headers = {
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01",
                         "content-type": "application/json",
+                        "anthropic-version": "2023-06-01", # Basic Claude-3 version
                     }
+                    
+                    # Check for custom version header in client request
+                    if "anthropic-version" in client_headers:
+                        headers["anthropic-version"] = client_headers["anthropic-version"]
+                        logger.debug(f"Using client-provided Anthropic API version: {client_headers['anthropic-version']}")
+                    
+                    # IMPORTANT: Handle API authentication for regular Claude API or Claude Max
+                    # Use the authorization header directly if available (Claude Max) or fall back to x-api-key
+                    if "authorization" in client_headers and client_headers["authorization"].startswith("Bearer "):
+                        auth_value = client_headers["authorization"]
+                        logger.debug("Using Authorization header for Claude Max subscription")
+                        headers["authorization"] = auth_value
+                    else:
+                        # Fall back to x-api-key for regular Anthropic API
+                        logger.debug("Using x-api-key header for regular Anthropic API")
+                        headers["x-api-key"] = api_key
+                    
+                    # Forward Claude Max subscription-related headers if present
+                    subscription_headers = [
+                        "anthropic-beta",
+                        "anthropic-organization",
+                        "anthropic-account-id",
+                        "anthropic-client-id",
+                        "anthropic-client-secret",
+                        "anthropic-workspace-id"
+                    ]
+                    
+                    for header in subscription_headers:
+                        if header in client_headers:
+                            headers[header] = client_headers[header]
+                            logger.debug(f"Forwarding header: {header}")
+                    
+                    # Debug log the final headers we're sending (with API key redacted)
+                    if log_level == logging.DEBUG:
+                        safe_headers = headers.copy()
+                        if "x-api-key" in safe_headers:
+                            safe_headers["x-api-key"] = "**REDACTED**"
+                        logger.debug(f"Passthrough mode: Sending headers to Anthropic: {json.dumps(safe_headers)}")
                     
                     # Log the beautiful request
                     num_tools = len(request.tools) if request.tools else 0
@@ -1373,9 +1447,25 @@ async def create_message(
                                 # Forward status code if there's an error
                                 if response.status_code != 200:
                                     error_body = await response.aread()
+                                    error_text = error_body.decode()
+                                    logger.error(f"Anthropic streaming API error ({response.status_code}): {error_text}")
+                                    
+                                    # For auth errors, provide more helpful debugging info
+                                    if response.status_code == 401:
+                                        # Show which auth headers were sent (without revealing values)
+                                        auth_headers_used = []
+                                        if "authorization" in headers:
+                                            auth_headers_used.append("authorization: Bearer ****")
+                                        if "x-api-key" in headers:
+                                            auth_headers_used.append("x-api-key: ****")
+                                        
+                                        # Log additional debug info
+                                        logger.error(f"Streaming authentication error details - Headers used: {auth_headers_used}")
+                                        logger.error(f"Anthropic model requested for streaming: {model_name}")
+                                    
                                     raise HTTPException(
                                         status_code=response.status_code,
-                                        detail=f"Anthropic API error: {error_body.decode()}"
+                                        detail=f"Anthropic API error: {error_text}"
                                     )
                                 
                                 # Stream the response directly
@@ -1423,7 +1513,28 @@ async def create_message(
                     
                     # Dump the original request to JSON (preserving Anthropic format)
                     request_dict = request.dict(exclude_none=True, exclude_unset=True)
-                    request_dict["model"] = model_name.replace("anthropic/", "")  # Remove prefix for API
+                    
+                    # Extract client headers first to avoid reference before assignment
+                    client_headers = dict(raw_request.headers.items())
+                    
+                    # Normalize header keys to lowercase for consistent lookup
+                    client_headers_normalized = {k.lower(): v for k, v in client_headers.items()}
+                    client_headers = {**client_headers, **client_headers_normalized}
+                    
+                    # Handle model name format based on API used:
+                    # - Claude Max (auth token present) may use full model name without removing prefixes
+                    # - Regular Anthropic API needs the "anthropic/" prefix removed
+                    if "authorization" in client_headers and client_headers["authorization"].startswith("Bearer "):
+                        # For Claude Max, use the original model requested
+                        # Claude Max uses original model names like "claude-3-7-sonnet-20250219"
+                        original_model = request.original_model if hasattr(request, "original_model") and request.original_model else request.model
+                        model_no_prefix = original_model.replace("anthropic/", "")
+                        request_dict["model"] = model_no_prefix
+                        logger.debug(f"Using original model for Claude Max: {model_no_prefix}")
+                    else:
+                        # Regular Anthropic API needs the "anthropic/" prefix removed
+                        request_dict["model"] = model_name.replace("anthropic/", "")
+                        logger.debug(f"Using model for regular API: {request_dict['model']}")
                     
                     # Remove empty or null fields that might cause API errors
                     # Specifically, don't send tool_choice if tools is not present
@@ -1437,17 +1548,33 @@ async def create_message(
                             logger.debug(f"Removing empty field from request: {key}")
                             request_dict.pop(key)
                     
-                    # Extract client's API key from headers if available
+                    # Extract ALL authentication related headers from the client request
                     client_api_key = None
                     client_headers = dict(raw_request.headers.items())
+                    
+                    # Normalize header keys to lowercase for consistent lookup
+                    client_headers_normalized = {k.lower(): v for k, v in client_headers.items()}
+                    client_headers = {**client_headers, **client_headers_normalized}
+                    
+                    # Debug: log all headers in passthrough mode (with sensitive values redacted)
+                    if log_level == logging.DEBUG:
+                        safe_headers = {k: ("**REDACTED**" if k.lower() in ["x-api-key", "authorization"] else v) 
+                                     for k, v in client_headers.items()}
+                        logger.debug(f"Passthrough mode: Received headers: {json.dumps(safe_headers)}")
+                    
+                    # Try all possible API key header variations
                     if "x-api-key" in client_headers:
                         client_api_key = client_headers["x-api-key"]
-                        logger.debug("Using client's API key from request headers")
+                        logger.debug("Found client's API key in x-api-key header")
                     elif "authorization" in client_headers:
                         auth_header = client_headers.get("authorization", "")
                         if auth_header.startswith("Bearer "):
                             client_api_key = auth_header.replace("Bearer ", "")
-                            logger.debug("Using client's API key from Authorization header")
+                            logger.debug("Found client's API key in Authorization Bearer header")
+                    # Claude Max might use different headers
+                    elif "anthropic-api-key" in client_headers:
+                        client_api_key = client_headers["anthropic-api-key"]
+                        logger.debug("Found client's API key in anthropic-api-key header")
                     
                     # Use client's key if available, fall back to server's key
                     api_key = client_api_key or ANTHROPIC_API_KEY
@@ -1457,12 +1584,49 @@ async def create_message(
                             detail="No API key found for Anthropic. Please provide an API key in the request headers or set ANTHROPIC_API_KEY in environment variables."
                         )
                     
-                    # Create headers with the appropriate API key
+                    # Create headers using the most updated API version for Claude Max support
                     headers = {
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01",
                         "content-type": "application/json",
+                        "anthropic-version": "2023-06-01", # Basic Claude-3 version
                     }
+                    
+                    # Check for custom version header in client request
+                    if "anthropic-version" in client_headers:
+                        headers["anthropic-version"] = client_headers["anthropic-version"]
+                        logger.debug(f"Using client-provided Anthropic API version: {client_headers['anthropic-version']}")
+                    
+                    # IMPORTANT: Handle API authentication for regular Claude API or Claude Max
+                    # Use the authorization header directly if available (Claude Max) or fall back to x-api-key
+                    if "authorization" in client_headers and client_headers["authorization"].startswith("Bearer "):
+                        auth_value = client_headers["authorization"]
+                        logger.debug("Using Authorization header for Claude Max subscription")
+                        headers["authorization"] = auth_value
+                    else:
+                        # Fall back to x-api-key for regular Anthropic API
+                        logger.debug("Using x-api-key header for regular Anthropic API")
+                        headers["x-api-key"] = api_key
+                    
+                    # Forward Claude Max subscription-related headers if present
+                    subscription_headers = [
+                        "anthropic-beta",
+                        "anthropic-organization",
+                        "anthropic-account-id",
+                        "anthropic-client-id",
+                        "anthropic-client-secret",
+                        "anthropic-workspace-id"
+                    ]
+                    
+                    for header in subscription_headers:
+                        if header in client_headers:
+                            headers[header] = client_headers[header]
+                            logger.debug(f"Forwarding header: {header}")
+                    
+                    # Debug log the final headers we're sending (with API key redacted)
+                    if log_level == logging.DEBUG:
+                        safe_headers = headers.copy()
+                        if "x-api-key" in safe_headers:
+                            safe_headers["x-api-key"] = "**REDACTED**"
+                        logger.debug(f"Passthrough mode: Sending headers to Anthropic: {json.dumps(safe_headers)}")
                     
                     # Log the beautiful request
                     num_tools = len(request.tools) if request.tools else 0
@@ -1493,9 +1657,25 @@ async def create_message(
                         
                         # Check for errors
                         if response.status_code != 200:
+                            error_text = response.text
+                            logger.error(f"Anthropic API error ({response.status_code}): {error_text}")
+                            
+                            # For auth errors, provide more helpful debugging info
+                            if response.status_code == 401:
+                                # Show which auth headers were sent (without revealing values)
+                                auth_headers_used = []
+                                if "authorization" in headers:
+                                    auth_headers_used.append("authorization: Bearer ****")
+                                if "x-api-key" in headers:
+                                    auth_headers_used.append("x-api-key: ****")
+                                
+                                # Log additional debug info
+                                logger.error(f"Authentication error details - Headers used: {auth_headers_used}")
+                                logger.error(f"Anthropic model requested: {model_name}")
+                            
                             raise HTTPException(
                                 status_code=response.status_code,
-                                detail=f"Anthropic API error: {response.text}"
+                                detail=f"Anthropic API error: {error_text}"
                             )
                         
                         # Return the response directly

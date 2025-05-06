@@ -2137,7 +2137,10 @@ async def count_tokens(
                 
                 # Dump the original request to JSON (preserving Anthropic format)
                 request_dict = request.dict(exclude_none=True, exclude_unset=True)
-                request_dict["model"] = model_name.replace("anthropic/", "")  # Remove prefix for API
+                
+                # Always remove the 'anthropic/' prefix for the Anthropic API
+                request_dict["model"] = model_name.replace("anthropic/", "")
+                logger.debug(f"Using model for token counting: {request_dict['model']}")
                 
                 # Remove empty or null fields that might cause API errors
                 # Specifically, don't send tool_choice if tools is not present
@@ -2151,32 +2154,23 @@ async def count_tokens(
                         logger.debug(f"Removing empty field from request: {key}")
                         request_dict.pop(key)
                 
-                # Extract client's API key from headers if available
-                client_api_key = None
-                client_headers = dict(raw_request.headers.items())
-                if "x-api-key" in client_headers:
-                    client_api_key = client_headers["x-api-key"]
-                    logger.debug("Using client's API key from request headers for token counting")
-                elif "authorization" in client_headers:
-                    auth_header = client_headers.get("authorization", "")
-                    if auth_header.startswith("Bearer "):
-                        client_api_key = auth_header.replace("Bearer ", "")
-                        logger.debug("Using client's API key from Authorization header for token counting")
+                # For token counting, always use the environment API key for simplicity
+                api_key = ANTHROPIC_API_KEY
                 
-                # Use client's key if available, fall back to server's key
-                api_key = client_api_key or ANTHROPIC_API_KEY
                 if not api_key:
                     raise HTTPException(
                         status_code=401,
-                        detail="No API key found for Anthropic token counting. Please provide an API key in the request headers or set ANTHROPIC_API_KEY in environment variables."
+                        detail="No API key found for Anthropic token counting. Please set ANTHROPIC_API_KEY in environment variables."
                     )
                 
-                # Create headers with the appropriate API key
+                # Create headers with the API key from environment
                 headers = {
                     "x-api-key": api_key,
                     "anthropic-version": "2023-06-01",
                     "content-type": "application/json",
                 }
+                
+                logger.debug("Using environment ANTHROPIC_API_KEY for token counting")
                 
                 # Use httpx for async request with timeout
                 async with httpx.AsyncClient(timeout=30.0) as client:
@@ -2188,9 +2182,16 @@ async def count_tokens(
                     
                     # Check for errors
                     if response.status_code != 200:
+                        error_text = response.text
+                        logger.error(f"Anthropic token counting error ({response.status_code}): {error_text}")
+                        
+                        # Log model being used for token counting
+                        logger.error(f"Model used for token counting: {request_dict['model']}")
+                        
+                        # Return a clear error
                         raise HTTPException(
                             status_code=response.status_code,
-                            detail=f"Anthropic token counting error: {response.text}"
+                            detail=f"Anthropic token counting error: {error_text}"
                         )
                     
                     # Return the token count directly

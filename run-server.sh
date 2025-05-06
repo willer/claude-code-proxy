@@ -29,4 +29,4 @@ echo "Starting server with THINKER_MODEL=$THINKER_MODEL, BIG_MODEL=$BIG_MODEL, S
 echo "Logging to $LOG_FILE"
 
 # Run server and log output
-uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload #2>&1 | tee -a "$LOG_FILE"
+uv run uvicorn app:app --host 0.0.0.0 --port 8082 --reload #2>&1 | tee -a "$LOG_FILE"

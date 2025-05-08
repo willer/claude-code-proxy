@@ -36,3 +36,4 @@ ENV/
 .vscode/
 *.swp
 *.swo
+**/.claude/settings.local.json

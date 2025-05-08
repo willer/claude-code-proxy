@@ -10,6 +10,7 @@ import asyncio
 from typing import Dict, Any, List, Union, Optional
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
+import litellm
 
 from app.models import MessagesRequest, MessagesResponse
 from app.utils.auth import get_anthropic_auth_headers
@@ -93,11 +94,15 @@ async def create_message(
             logger.info(f"📌 TRUE PASSTHROUGH: connecting directly to Anthropic API for {request.model}")
             return await handle_anthropic_direct(request, raw_request)
         
-        # If not direct passthrough, we would handle other model providers here
-        # This is just a placeholder for now
+        # If not in passthrough mode, use LiteLLM to handle the request with the configured model
+        if BIG_MODEL != "passthrough":
+            logger.info(f"📌 USING NON-PASSTHROUGH MODEL: {BIG_MODEL} for request with model {request.model}")
+            return await handle_litellm(request, raw_request, BIG_MODEL)
+        
+        # If we reach here, we don't have a handler for this case
         raise HTTPException(
             status_code=501,
-            detail="Non-Anthropic models are not implemented in this module yet"
+            detail="Unsupported model or configuration"
         )
     
     except Exception as e:
@@ -248,6 +253,159 @@ async def handle_anthropic_streaming(request: MessagesRequest, raw_request: Requ
     except Exception as e:
         logger.error(f"Error setting up streaming: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error streaming from Anthropic: {str(e)}")
+
+
+async def handle_litellm(request: MessagesRequest, raw_request: Request, model_name: str):
+    """
+    Handle requests using LiteLLM (supports OpenAI, Anthropic, and other models).
+    
+    Args:
+        request: The message request
+        raw_request: The raw FastAPI request
+        model_name: The model name to use with LiteLLM
+        
+    Returns:
+        MessagesResponse or StreamingResponse
+        
+    Raises:
+        HTTPException: If an error occurs with the LiteLLM call
+    """
+    try:
+        # Convert Anthropic format to LiteLLM format
+        litellm_request = convert_anthropic_to_litellm(request.dict(exclude_none=True, exclude_unset=True))
+        
+        # Override the model with the configured model - strip provider prefix for LiteLLM
+        clean_model_name = model_name
+        if model_name.startswith("openai/"):
+            clean_model_name = model_name.replace("openai/", "")
+        elif model_name.startswith("anthropic/"):
+            clean_model_name = model_name.replace("anthropic/", "")
+            
+        litellm_request["model"] = clean_model_name
+        
+        # Extract client headers for API keys
+        client_headers = dict(raw_request.headers.items())
+        client_headers_normalized = {k.lower(): v for k, v in client_headers.items()}
+        client_headers = {**client_headers, **client_headers_normalized}
+        
+        # Get streaming preference
+        is_streaming = request.stream if request.stream is not None else False
+        
+        # For streaming requests
+        if is_streaming:
+            return await handle_litellm_streaming(litellm_request, request, model_name)
+        
+        # For non-streaming requests
+        # Log the request details (with sensitive info redacted)
+        num_tools = len(request.tools) if request.tools else 0
+        reasoning_level = "high" if request.thinking and request.thinking.budget_tokens and request.thinking.budget_tokens > 4096 else ("medium" if request.thinking and request.thinking.budget_tokens else None)
+        reasoning_str = f" ({reasoning_level})" if reasoning_level else ""
+        logger.info(f"⏳ LiteLLM request with {model_name}{reasoning_str}, {len(request.messages)} msgs, {num_tools} tools")
+        
+        # Make the LiteLLM call
+        start_time = time.time()
+        
+        # Try to get API keys from headers or environment
+        api_key = None
+        if model_name.startswith("openai/"):
+            api_key = client_headers.get("openai-api-key", os.environ.get("OPENAI_API_KEY"))
+        elif model_name.startswith("anthropic/"):
+            api_key = client_headers.get("anthropic-api-key", os.environ.get("ANTHROPIC_API_KEY"))
+        
+        # Make the API call with completion
+        try:
+            litellm_response = await litellm.acompletion(**litellm_request, api_key=api_key)
+        except Exception as e:
+            logger.error(f"LiteLLM error: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error calling {model_name}: {str(e)}")
+        
+        # Convert LiteLLM response to Anthropic format
+        anthropic_response = convert_litellm_to_anthropic(litellm_response, original_model=request.model)
+        
+        # Calculate and log timing information
+        end_time = time.time()
+        elapsed_seconds = end_time - start_time
+        tokens_out = anthropic_response.get("usage", {}).get("output_tokens", 0)
+        tokens_in = anthropic_response.get("usage", {}).get("input_tokens", 0)
+        
+        tokens_per_second = tokens_out / elapsed_seconds if elapsed_seconds > 0 else 0
+        logger.info(f"✅ Response: {tokens_out} tokens in {elapsed_seconds:.2f}s ({tokens_per_second:.1f} t/s), input: {tokens_in} tokens")
+        
+        return anthropic_response
+        
+    except Exception as e:
+        logger.error(f"Error in LiteLLM handler: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error with LiteLLM: {str(e)}")
+
+
+async def handle_litellm_streaming(litellm_request: Dict[str, Any], original_request: MessagesRequest, model_name: str):
+    """
+    Handle streaming requests via LiteLLM.
+    
+    Args:
+        litellm_request: The request in LiteLLM format
+        original_request: The original message request
+        model_name: The model name with proper prefix
+        
+    Returns:
+        StreamingResponse
+        
+    Raises:
+        HTTPException: If an error occurs with the LiteLLM streaming
+    """
+    try:
+        # Log the request details
+        num_tools = len(original_request.tools) if original_request.tools else 0
+        reasoning_level = "high" if original_request.thinking and original_request.thinking.budget_tokens and original_request.thinking.budget_tokens > 4096 else ("medium" if original_request.thinking and original_request.thinking.budget_tokens else None)
+        reasoning_str = f" ({reasoning_level})" if reasoning_level else ""
+        logger.info(f"⏳ LiteLLM streaming with {model_name}{reasoning_str}, {len(original_request.messages)} msgs, {num_tools} tools")
+        
+        # Create an async function for streaming
+        async def stream_response():
+            try:
+                # Set the correct model and get an API key if needed
+                api_key = None
+                clean_model_name = model_name
+                
+                # Get the correct API key and clean model name
+                if model_name.startswith("openai/"):
+                    api_key = os.environ.get("OPENAI_API_KEY")
+                    clean_model_name = model_name.replace("openai/", "")
+                elif model_name.startswith("anthropic/"):
+                    api_key = os.environ.get("ANTHROPIC_API_KEY")
+                    clean_model_name = model_name.replace("anthropic/", "")
+                
+                # Make the streaming request
+                # Override model in the request to use clean name
+                litellm_request["model"] = clean_model_name
+                
+                stream = await litellm.acompletion(
+                    **litellm_request,
+                    stream=True,
+                    api_key=api_key
+                )
+                
+                async for chunk in stream:
+                    # Convert chunk to JSON string and yield as SSE
+                    chunk_json = json.dumps(chunk)
+                    yield f"data: {chunk_json}\n\n".encode('utf-8')
+                
+            except Exception as e:
+                logger.error(f"Error in LiteLLM streaming: {str(e)}")
+                error_json = json.dumps({"error": {"message": str(e)}})
+                yield f"data: {error_json}\n\n".encode('utf-8')
+        
+        # Return streaming response
+        return StreamingResponse(
+            stream_response(),
+            media_type="text/event-stream"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error setting up LiteLLM streaming: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error streaming from LiteLLM: {str(e)}")
 
 
 async def handle_anthropic_non_streaming(request: MessagesRequest, raw_request: Request, model_name: str):

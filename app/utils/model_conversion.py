@@ -18,19 +18,43 @@ def convert_anthropic_to_litellm(anthropic_request: Dict[str, Any]) -> Dict[str,
     Returns:
         Request in LiteLLM format
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
     # Create a new dictionary for the LiteLLM request
     litellm_request = {
         "model": anthropic_request.get("model"),
-        "messages": anthropic_request.get("messages", []),
         "max_tokens": anthropic_request.get("max_tokens"),
         "temperature": anthropic_request.get("temperature"),
         "stream": anthropic_request.get("stream", False),
     }
     
-    # Handle optional parameters
-    if "system" in anthropic_request and anthropic_request["system"]:
-        litellm_request["system"] = anthropic_request["system"]
+    # Handle messages and system prompt format based on model
+    model = anthropic_request.get("model", "")
+    messages = anthropic_request.get("messages", [])
+    
+    # Special handling for system message with OpenAI models
+    has_system = "system" in anthropic_request and anthropic_request["system"]
+    
+    if model.startswith("openai/"):
+        # For OpenAI, convert system prompt to a system message
+        if has_system:
+            # Add system message to the beginning of messages list
+            system_message = {"role": "system", "content": anthropic_request["system"]}
+            litellm_request["messages"] = [system_message] + messages
+            # Do not include separate system parameter for OpenAI
+        else:
+            litellm_request["messages"] = messages
         
+        logger.debug(f"Converted for OpenAI: System added to messages array")
+    else:
+        # For other providers like Anthropic, keep both system and messages separate
+        litellm_request["messages"] = messages
+        
+        if has_system:
+            litellm_request["system"] = anthropic_request["system"]
+    
+    # Handle common optional parameters
     if "stop_sequences" in anthropic_request and anthropic_request["stop_sequences"]:
         litellm_request["stop"] = anthropic_request["stop_sequences"]
         
@@ -40,9 +64,10 @@ def convert_anthropic_to_litellm(anthropic_request: Dict[str, Any]) -> Dict[str,
     if "top_k" in anthropic_request and anthropic_request["top_k"] is not None:
         litellm_request["top_k"] = anthropic_request["top_k"]
         
-    # Handle metadata
+    # Handle metadata (if supported by provider)
     if "metadata" in anthropic_request and anthropic_request["metadata"]:
-        litellm_request["metadata"] = anthropic_request["metadata"]
+        if not model.startswith("openai/"):  # OpenAI doesn't support metadata directly
+            litellm_request["metadata"] = anthropic_request["metadata"]
     
     # Handle tools
     if "tools" in anthropic_request and anthropic_request["tools"]:
@@ -51,13 +76,14 @@ def convert_anthropic_to_litellm(anthropic_request: Dict[str, Any]) -> Dict[str,
     if "tool_choice" in anthropic_request and anthropic_request["tool_choice"]:
         litellm_request["tool_choice"] = anthropic_request["tool_choice"]
     
-    # Handle thinking budget if present
+    # Handle thinking budget if present (provider-specific)
     if "thinking" in anthropic_request and anthropic_request["thinking"]:
-        thinking_config = anthropic_request["thinking"]
-        if thinking_config.get("enabled", True) and thinking_config.get("budget_tokens"):
-            # This assumes LiteLLM has a way to handle thinking budget
-            litellm_request["thinking_budget"] = thinking_config.get("budget_tokens")
+        if not model.startswith("openai/"):  # OpenAI doesn't support thinking budget
+            thinking_config = anthropic_request["thinking"]
+            if thinking_config.get("enabled", True) and thinking_config.get("budget_tokens"):
+                litellm_request["thinking_budget"] = thinking_config.get("budget_tokens")
     
+    logger.debug(f"Converted request for model {model}: {litellm_request.keys()}")
     return litellm_request
 
 

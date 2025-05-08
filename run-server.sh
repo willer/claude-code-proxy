@@ -14,15 +14,17 @@ export CLICOLOR_FORCE=1
 #export LOGLEVEL=DEBUG
 export SHOW_MODEL_DETAILS=true
 
-# Ancillary model configuration: o3 + o4-mini
-export THINKER_MODEL="openai/o3"
 #export SMALL_MODEL="openai/gpt-4o-mini"
 export SMALL_MODEL="anthropic/claude-3-5-haiku-20241022"
 
 # Main coder/talker model options
 #export BIG_MODEL="gemini/gemini-2.5-pro-exp-03-25"
 #export BIG_MODEL="openai/o4-mini"
-export BIG_MODEL="passthrough"
+#export BIG_MODEL="passthrough"
+export BIG_MODEL="openai/o3"
+
+# Ancillary model configuration: o3 + o4-mini
+export THINKER_MODEL="openai/o3"
 
 # Print server startup info
 echo "Starting server with THINKER_MODEL=$THINKER_MODEL, BIG_MODEL=$BIG_MODEL, SMALL_MODEL=$SMALL_MODEL"

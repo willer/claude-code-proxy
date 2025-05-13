@@ -20,8 +20,8 @@ export SMALL_MODEL="anthropic/claude-3-5-haiku-20241022"
 # Main coder/talker model options
 #export BIG_MODEL="gemini/gemini-2.5-pro-exp-03-25"
 #export BIG_MODEL="openai/o4-mini"
-#export BIG_MODEL="passthrough"
-export BIG_MODEL="openai/o3"
+export BIG_MODEL="passthrough"
+#export BIG_MODEL="openai/o3"
 
 # Ancillary model configuration: o3 + o4-mini
 export THINKER_MODEL="openai/o3"
